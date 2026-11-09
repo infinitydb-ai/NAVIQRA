@@ -78,13 +78,26 @@ def test_postgres_recovery_lifecycle_and_migration_upgrade():
     assert resolved["resolution_outcome"]["confirmation_id"].startswith("SIM-REC-")
 
     # Replay idempotency
+    audit_events_before_replay = platform_store.recovery_audit(tenant, case["case_id"])
     replay = platform_store.execute_recovery(tenant, case["case_id"], "pg-idempotency-key-01")
+    audit_events_after_replay = platform_store.recovery_audit(tenant, case["case_id"])
+
+    # Replay must return the original confirmation ID
     assert replay["resolution_outcome"]["confirmation_id"] == resolved["resolution_outcome"]["confirmation_id"]
+
+    # Replay must not create additional audit events
+    assert len(audit_events_after_replay) == len(audit_events_before_replay)
 
     # Verify audit events
     audit_events = platform_store.recovery_audit(tenant, case["case_id"])
-    assert len(audit_events) == 4
+    assert len(audit_events) == 5
     assert [e["action"] for e in audit_events] == [
-        "recovery.created", "recovery.option_selected", "recovery.approved", "recovery.resolved"
+        "recovery.created",
+        "recovery.option_selected",
+        "recovery.approved",
+        "recovery.execution_started",
+        "recovery.resolved",
     ]
+    assert sum(1 for e in audit_events if e["action"] == "recovery.execution_started") == 1
+    assert sum(1 for e in audit_events if e["action"] == "recovery.resolved") == 1
 
