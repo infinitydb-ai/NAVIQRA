@@ -1,4 +1,4 @@
-"""Microbenchmark local v0.4.1 primitives; not a production or end-to-end benchmark."""
+"""Microbenchmark local v0.5.0 primitives; not a production or end-to-end benchmark."""
 from __future__ import annotations
 import json, statistics, tempfile, time
 from pathlib import Path
@@ -37,7 +37,7 @@ def main():
                               "mean_ms":round(statistics.mean(v),4)} for k,v in samples.items()},
                 "limitations":["not a production deployment","no network or LLM latency",
                                "synthetic inventory only","single-process local measurements"]}
-        out=Path(__file__).resolve().parents[1]/"benchmark-results-v0.4.1.json"
+        out=Path(__file__).resolve().parents[1]/"benchmark-results-v0.5.0.json"
         out.write_text(json.dumps(result,indent=2)+"\n")
         print(json.dumps(result,indent=2))
 

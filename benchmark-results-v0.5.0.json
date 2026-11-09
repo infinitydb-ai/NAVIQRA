@@ -4,19 +4,19 @@
   "environment": "local SQLite + synthetic in-process provider",
   "metrics": {
     "memory_read_ms": {
-      "p50_ms": 0.1808,
-      "p95_ms": 0.3342,
-      "mean_ms": 0.2984
+      "p50_ms": 3.6947,
+      "p95_ms": 4.7895,
+      "mean_ms": 3.7554
     },
     "provider_search_ms": {
-      "p50_ms": 0.0036,
-      "p95_ms": 0.0051,
-      "mean_ms": 0.0046
+      "p50_ms": 0.0344,
+      "p95_ms": 0.0562,
+      "mean_ms": 0.0388
     },
     "audit_write_ms": {
-      "p50_ms": 1.3471,
-      "p95_ms": 1.992,
-      "mean_ms": 1.5724
+      "p50_ms": 15.3832,
+      "p95_ms": 17.9316,
+      "mean_ms": 17.6995
     }
   },
   "limitations": [

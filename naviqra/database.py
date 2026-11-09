@@ -34,11 +34,20 @@ class DatabaseConnection:
                 self.execute(statement)
 
     def __enter__(self):
-        self.raw.__enter__()
+        if hasattr(self.raw, "__enter__"):
+            self.raw.__enter__()
         return self
 
+    def close(self) -> None:
+        if hasattr(self.raw, "close") and callable(self.raw.close):
+            self.raw.close()
+
     def __exit__(self, exc_type, exc, tb):
-        return self.raw.__exit__(exc_type, exc, tb)
+        try:
+            if hasattr(self.raw, "__exit__"):
+                return self.raw.__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
 
     def __getattr__(self, name: str):
         return getattr(self.raw, name)
