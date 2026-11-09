@@ -30,7 +30,7 @@ jobs:
       - name: Local benchmark smoke test
         run: python benchmarks/v05_benchmark.py
       - name: Build wheel
-        run: python -m pip wheel . --no-deps --no-build-isolation -w dist
+        run: python -m pip wheel . --no-deps -w dist
 
   postgres-integration:
     runs-on: ubuntu-latest
