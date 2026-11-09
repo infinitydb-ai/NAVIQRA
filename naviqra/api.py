@@ -17,10 +17,26 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from naviqra import __version__
 from naviqra.agents.orchestrator import TravelOrchestrator
 from naviqra.booking import BookingService
-from naviqra.models import ApprovalRequest, BookingIntent, MemoryRecord, TripRequest
+from naviqra.models import (
+    ApprovalRequest,
+    BookingIntent,
+    MemoryRecord,
+    TripRequest,
+    RecoveryCreateRequest,
+    RecoverySelectRequest,
+    RecoveryDecisionRequest,
+    RecoveryExecuteRequest,
+    RecoveryCancelRequest,
+)
 from naviqra.providers import DemoProvider, ProviderRegistry, SandboxProvider
 from naviqra.store import SQLiteStore
-from naviqra.platform.core import PlatformStore, AgentRuntime
+from naviqra.platform.core import (
+    PlatformStore,
+    AgentRuntime,
+    RecoveryCaseNotFoundError,
+    RecoveryConflictError,
+    RecoveryValidationError,
+)
 import json
 from contextlib import asynccontextmanager
 
@@ -342,3 +358,111 @@ def tenant_audit(tenant_id: str, limit: int = 100):
 @app.delete("/v2/tenants/{tenant_id}/travelers/{traveler_id}/memory")
 def delete_traveler_memory(tenant_id: str, traveler_id: str):
     return platform_store.delete_traveler(tenant_id, traveler_id)
+
+
+# v0.5 travel disruption recovery lifecycle
+@app.post("/v2/tenants/{tenant_id}/recovery", status_code=201)
+def create_recovery(tenant_id: str, payload: RecoveryCreateRequest):
+    try:
+        return platform_store.create_recovery(
+            tenant=tenant_id,
+            trip_id=payload.trip_id,
+            disruption=payload.disruption,
+            options=payload.options,
+            context=payload.context,
+        )
+    except RecoveryValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("Failed to create recovery case")
+        raise HTTPException(status_code=500, detail="Failed to create recovery case") from None
+
+
+@app.get("/v2/tenants/{tenant_id}/recovery")
+def list_recoveries(tenant_id: str, status: str | None = None, limit: int = 100):
+    if not 1 <= limit <= 500:
+        raise HTTPException(status_code=422, detail="limit must be 1..500")
+    return {"cases": platform_store.list_recoveries(tenant_id, status=status, limit=limit)}
+
+
+@app.get("/v2/tenants/{tenant_id}/recovery/{case_id}")
+def get_recovery(tenant_id: str, case_id: str):
+    case = platform_store.get_recovery(tenant_id, case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail=f"Recovery case '{case_id}' not found")
+    return case
+
+
+@app.post("/v2/tenants/{tenant_id}/recovery/{case_id}/select")
+def select_recovery_option(tenant_id: str, case_id: str, payload: RecoverySelectRequest):
+    try:
+        return platform_store.select_recovery_option(
+            tenant_id, case_id, payload.selected_option_id, payload.notes
+        )
+    except RecoveryCaseNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RecoveryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RecoveryValidationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v2/tenants/{tenant_id}/recovery/{case_id}/decision")
+def decide_recovery(tenant_id: str, case_id: str, payload: RecoveryDecisionRequest):
+    try:
+        return platform_store.decide_recovery(
+            tenant_id, case_id, payload.approved, payload.approver, payload.notes
+        )
+    except RecoveryCaseNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RecoveryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RecoveryValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/v2/tenants/{tenant_id}/recovery/{case_id}/execute")
+def execute_recovery(tenant_id: str, case_id: str, payload: RecoveryExecuteRequest):
+    try:
+        return platform_store.execute_recovery(
+            tenant=tenant_id,
+            case_id=case_id,
+            idempotency_key=payload.idempotency_key,
+            provider=payload.provider,
+            simulate_failure=payload.simulate_failure,
+            execution_details=payload.details,
+        )
+    except RecoveryCaseNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RecoveryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RecoveryValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/v2/tenants/{tenant_id}/recovery/{case_id}/cancel")
+def cancel_recovery(tenant_id: str, case_id: str, payload: RecoveryCancelRequest):
+    try:
+        return platform_store.cancel_recovery(
+            tenant=tenant_id,
+            case_id=case_id,
+            reason=payload.reason,
+            cancelled_by=payload.cancelled_by,
+        )
+    except RecoveryCaseNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RecoveryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RecoveryValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/v2/tenants/{tenant_id}/recovery/{case_id}/audit")
+def recovery_audit(tenant_id: str, case_id: str):
+    try:
+        return {"case_id": case_id, "events": platform_store.recovery_audit(tenant_id, case_id)}
+    except RecoveryCaseNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+

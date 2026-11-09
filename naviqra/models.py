@@ -108,3 +108,44 @@ class AgentPlan(StrictModel):
     itinerary: Itinerary
     memory_used: list[MemoryRecord]
     warnings: list[str] = Field(default_factory=list)
+
+
+class RecoveryStatus(str, Enum):
+    AWAITING_SELECTION = "awaiting_selection"
+    APPROVED = "approved"
+    EXECUTING = "executing"
+    RESOLVED = "resolved"
+    REJECTED = "rejected"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class RecoveryCreateRequest(StrictModel):
+    trip_id: str = Field(min_length=1, max_length=128)
+    disruption: str = Field(min_length=1, max_length=500)
+    options: list[dict[str, Any]] = Field(min_length=1)
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class RecoverySelectRequest(StrictModel):
+    selected_option_id: str = Field(min_length=1, max_length=128)
+    notes: str = Field(default="", max_length=500)
+
+
+class RecoveryDecisionRequest(StrictModel):
+    approved: bool
+    approver: str = Field(min_length=1, max_length=128)
+    notes: str = Field(default="", max_length=500)
+
+
+class RecoveryExecuteRequest(StrictModel):
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    provider: str = Field(default="sandbox", min_length=1, max_length=64)
+    simulate_failure: bool = False
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class RecoveryCancelRequest(StrictModel):
+    reason: str = Field(min_length=1, max_length=500)
+    cancelled_by: str = Field(min_length=1, max_length=128)
+

@@ -101,7 +101,15 @@ CREATE TABLE IF NOT EXISTS recovery_cases (
   disruption TEXT NOT NULL,
   options TEXT NOT NULL,
   selected_option TEXT,
-  status TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('awaiting_selection', 'approved', 'executing', 'resolved', 'rejected', 'failed', 'cancelled')),
   created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT '',
+  approval_metadata TEXT NOT NULL DEFAULT '{}',
+  execution_metadata TEXT NOT NULL DEFAULT '{}',
+  resolution_outcome TEXT,
+  idempotency_key TEXT,
+  context TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY (tenant, case_id)
 );
+CREATE INDEX IF NOT EXISTS idx_recovery_cases_tenant_status ON recovery_cases(tenant, status, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_recovery_cases_tenant_idempotency ON recovery_cases(tenant, idempotency_key) WHERE idempotency_key IS NOT NULL;

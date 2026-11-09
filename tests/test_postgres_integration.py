@@ -41,3 +41,50 @@ def test_postgres_migration_and_tenant_store_roundtrip():
     platform_store.audit(tenant, "ci", "test.write", "memory", traveler, {})
     assert platform_store.audit_events(tenant)[0]["action"] == "test.write"
     assert platform_store.delete_traveler(tenant, traveler)["memory_records_deleted"] == 1
+
+
+def test_postgres_recovery_lifecycle_and_migration_upgrade():
+    assert DSN
+    mig_0001 = Path(__file__).parents[1] / "migrations" / "0001_postgres_foundation.sql"
+    mig_0002 = Path(__file__).parents[1] / "migrations" / "0002_recovery_lifecycle.sql"
+    database = Database(DSN)
+    with database.connect() as conn:
+        conn.executescript(mig_0001.read_text(encoding="utf-8"))
+        # Execute migration 0002 twice to verify rerun idempotency
+        conn.executescript(mig_0002.read_text(encoding="utf-8"))
+        conn.executescript(mig_0002.read_text(encoding="utf-8"))
+
+    platform_store = PlatformStore(DSN, initialize=False)
+    tenant = f"ci-rec-{uuid4()}"
+    options = [
+        {"id": "alt-pg-1", "type": "flight", "price": 400.0, "currency": "USD"},
+        {"id": "alt-pg-2", "type": "flight", "price": 450.0, "currency": "USD"}
+    ]
+    case = platform_store.create_recovery(tenant, "trip-pg-1", "weather delay", options, {"pnr": "PG123"})
+    assert case["status"] == "awaiting_selection"
+    assert case["context"]["pnr"] == "PG123"
+
+    # Select
+    selected = platform_store.select_recovery_option(tenant, case["case_id"], "alt-pg-1", "prefer morning")
+    assert selected["selected_option"]["id"] == "alt-pg-1"
+
+    # Approve
+    approved = platform_store.decide_recovery(tenant, case["case_id"], True, "pg-auditor", "approved via policy")
+    assert approved["status"] == "approved"
+
+    # Execute
+    resolved = platform_store.execute_recovery(tenant, case["case_id"], "pg-idempotency-key-01")
+    assert resolved["status"] == "resolved"
+    assert resolved["resolution_outcome"]["confirmation_id"].startswith("SIM-REC-")
+
+    # Replay idempotency
+    replay = platform_store.execute_recovery(tenant, case["case_id"], "pg-idempotency-key-01")
+    assert replay["resolution_outcome"]["confirmation_id"] == resolved["resolution_outcome"]["confirmation_id"]
+
+    # Verify audit events
+    audit_events = platform_store.recovery_audit(tenant, case["case_id"])
+    assert len(audit_events) == 4
+    assert [e["action"] for e in audit_events] == [
+        "recovery.created", "recovery.option_selected", "recovery.approved", "recovery.resolved"
+    ]
+
