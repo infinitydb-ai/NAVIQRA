@@ -14,9 +14,10 @@ DSN = os.getenv("NAVIQRA_TEST_POSTGRES_DSN")
 pytestmark = pytest.mark.skipif(not DSN, reason="PostgreSQL integration DSN not configured")
 
 
-def _get_app_dsn(dsn: str) -> str:
+def _get_app_dsn(dsn: str, password: str = "") -> str:
     parsed = urlsplit(dsn)
-    netloc = f"naviqra_app:naviqra-app-password@{parsed.hostname}"
+    cred = "naviqra_app" if not password else f"naviqra_app:{password}"
+    netloc = f"{cred}@{parsed.hostname}"
     if parsed.port:
         netloc += f":{parsed.port}"
     return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
@@ -114,13 +115,13 @@ def test_postgres_recovery_lifecycle_and_migration_upgrade():
 
 
 def test_postgres_row_level_security_enforcement():
-    """Verify database-enforced Row-Level Security (RLS) across all 12 security criteria."""
+    """Verify database-enforced Row-Level Security (RLS) across all security criteria."""
     assert DSN
     mig_0001 = Path(__file__).parents[1] / "migrations" / "0001_postgres_foundation.sql"
     mig_0002 = Path(__file__).parents[1] / "migrations" / "0002_recovery_lifecycle.sql"
     mig_0003 = Path(__file__).parents[1] / "migrations" / "0003_row_level_security.sql"
 
-    # Criterion 12: Migration rerun safety (0003 executed multiple times consecutively)
+    # Migration rerun safety (0003 executed multiple times consecutively)
     admin_db = Database(DSN)
     with admin_db.connect() as conn:
         conn.executescript(mig_0001.read_text(encoding="utf-8"))
@@ -129,7 +130,25 @@ def test_postgres_row_level_security_enforcement():
         conn.executescript(mig_0003.read_text(encoding="utf-8"))
         conn.executescript(mig_0003.read_text(encoding="utf-8"))
 
-    # Criterion 11: FORCE ROW LEVEL SECURITY verification on all 7 tenant tables
+    # Provision ephemeral test password for naviqra_app runtime role (no hardcoded password in migration)
+    test_app_password = f"ci-test-pw-{uuid4().hex}"
+    with admin_db.connect() as conn:
+        conn.execute(f"ALTER ROLE naviqra_app WITH LOGIN PASSWORD '{test_app_password}'")
+
+    # Verify Table Ownership: runtime role must NOT be table owner
+    with admin_db.connect() as conn:
+        owner_row = conn.execute("SELECT tableowner FROM pg_tables WHERE schemaname = 'public' AND tablename = 'recovery_cases'").fetchone()
+        assert owner_row["tableowner"] != "naviqra_app"
+
+    # Verify Role Privileges: naviqra_app is NOT superuser, has NO BYPASSRLS, cannot create roles or databases
+    with admin_db.connect() as conn:
+        app_role = conn.execute("SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb FROM pg_roles WHERE rolname = 'naviqra_app'").fetchone()
+        assert app_role["rolsuper"] is False
+        assert app_role["rolbypassrls"] is False
+        assert app_role["rolcreaterole"] is False
+        assert app_role["rolcreatedb"] is False
+
+    # FORCE ROW LEVEL SECURITY verification on all 7 tenant tables
     with admin_db.connect() as conn:
         tables = [
             "t_memory", "graph_nodes", "graph_edges", "group_votes",
@@ -147,15 +166,34 @@ def test_postgres_row_level_security_enforcement():
             assert r["relrowsecurity"] is True, f"RLS not enabled on {r['relname']}"
             assert r["relforcerowsecurity"] is True, f"RLS not forced on {r['relname']}"
 
-    app_dsn = _get_app_dsn(DSN)
+    app_dsn = _get_app_dsn(DSN, test_app_password)
     app_db = Database(app_dsn)
     store = PlatformStore(app_dsn, initialize=False)
 
-    # Criterion 10: Non-superuser runtime role (naviqra_app)
+    # Runtime role least-privilege boundary checks:
+    # 1. naviqra_app cannot alter or drop RLS policies
     with app_db.connect() as conn:
-        user_info = conn.execute("SELECT current_user AS u, rolsuper FROM pg_roles WHERE rolname = current_user").fetchone()
-        assert user_info["u"] == "naviqra_app"
-        assert user_info["rolsuper"] is False
+        with pytest.raises(Exception) as exc:
+            conn.execute("DROP POLICY tenant_isolation_policy ON recovery_cases")
+        assert "must be owner" in str(exc.value).lower() or "permission denied" in str(exc.value).lower()
+        with pytest.raises(Exception) as exc:
+            conn.execute("CREATE POLICY rogue ON recovery_cases FOR ALL USING (true)")
+        assert "must be owner" in str(exc.value).lower() or "permission denied" in str(exc.value).lower()
+
+    # 2. naviqra_app cannot drop or alter tables
+    with app_db.connect() as conn:
+        with pytest.raises(Exception) as exc:
+            conn.execute("DROP TABLE recovery_cases")
+        assert "must be owner" in str(exc.value).lower() or "permission denied" in str(exc.value).lower()
+        with pytest.raises(Exception) as exc:
+            conn.execute("ALTER TABLE recovery_cases ADD COLUMN rogue TEXT")
+        assert "must be owner" in str(exc.value).lower() or "permission denied" in str(exc.value).lower()
+
+    # 3. naviqra_app cannot create roles
+    with app_db.connect() as conn:
+        with pytest.raises(Exception) as exc:
+            conn.execute("CREATE ROLE rogue_role")
+        assert "permission denied" in str(exc.value).lower()
 
     tenant_a = f"tenant-a-{uuid4()}"
     tenant_b = f"tenant-b-{uuid4()}"
@@ -251,12 +289,35 @@ def test_postgres_row_level_security_enforcement():
             )
         assert "violates row-level security policy" in str(exc_info.value).lower()
 
-    # Criterion 9: Connection reuse / transaction scoping: Transaction context does not leak across transactions
+    # Criterion 9: Context reset on COMMIT
+    with app_db.connect(tenant=tenant_a) as conn:
+        conn.execute("SELECT 1")
+    with app_db.connect() as conn:
+        cur_val = conn.execute("SELECT NULLIF(current_setting('app.current_tenant', true), '') AS t").fetchone()["t"]
+        assert cur_val is None
+
+    # Criterion 10: Context reset on ROLLBACK
+    try:
+        with app_db.connect(tenant=tenant_a) as conn:
+            conn.execute("SELECT 1")
+            raise RuntimeError("force_rollback_test")
+    except RuntimeError:
+        pass
+    with app_db.connect() as conn:
+        cur_val = conn.execute("SELECT NULLIF(current_setting('app.current_tenant', true), '') AS t").fetchone()["t"]
+        assert cur_val is None
+
+    # Criterion 11: Connection reuse: Subsequent queries on the same connection cannot read prior tenant data
     with app_db.connect(tenant=tenant_a) as conn:
         rows_a = conn.execute("SELECT * FROM recovery_cases").fetchall()
         assert len(rows_a) >= 1
-    # Next transaction without tenant parameter gets 0 rows
     with app_db.connect() as conn:
         rows_none = conn.execute("SELECT * FROM recovery_cases").fetchall()
         assert len(rows_none) == 0
+
+    # Criterion 12: Session Role Switching (SET ROLE naviqra_app) within admin connection
+    with admin_db.connect() as conn:
+        conn.execute("SET ROLE naviqra_app")
+        assert len(conn.execute("SELECT * FROM recovery_cases").fetchall()) == 0
+        conn.execute("RESET ROLE")
 

@@ -72,15 +72,21 @@ CREATE POLICY tenant_isolation_policy ON recovery_cases
   WITH CHECK (tenant = NULLIF(current_setting('app.current_tenant', true), ''));
 
 -- 3. Dedicated unprivileged application runtime role definition
+-- Security requirement: No default or hardcoded credentials in migration files.
+-- Role is created with NOLOGIN; production infrastructure must provision credentials
+-- out-of-band via ALTER ROLE naviqra_app WITH LOGIN PASSWORD '...';
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'naviqra_app') THEN
-    CREATE ROLE naviqra_app WITH LOGIN PASSWORD 'naviqra-app-password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+    CREATE ROLE naviqra_app WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
   ELSE
-    ALTER ROLE naviqra_app WITH LOGIN PASSWORD 'naviqra-app-password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+    ALTER ROLE naviqra_app WITH NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
   END IF;
 END
 $$;
+
+-- Allow migration / admin user to switch into naviqra_app via SET ROLE for pooled execution
+GRANT naviqra_app TO CURRENT_USER;
 
 GRANT USAGE ON SCHEMA public TO naviqra_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO naviqra_app;

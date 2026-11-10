@@ -21,9 +21,17 @@ secrets, and API docs disabled by default. Startup checks both persistence schem
   encrypted backups, and restore drills.
 - Row-Level Security (RLS) enabled and forced on all seven tenant-owned tables
   (`t_memory`, `graph_nodes`, `graph_edges`, `group_votes`, `agent_runs`, `audit_events`, `recovery_cases`).
-- Dedicated runtime role `naviqra_app` configured with `NOSUPERUSER NOBYPASSRLS`.
+- Dedicated runtime role `naviqra_app` configured with `NOSUPERUSER NOBYPASSRLS NOLOGIN`.
+  Credentials must be provisioned out-of-band via secure environment secret stores, never
+  hardcoded in DDL migrations.
+- Runtime role is strictly non-owner; table creation, schema modification, and policy
+  alterations are restricted exclusively to migration roles.
+- Superusers and roles with `BYPASSRLS` must NEVER be used by the application, as
+  PostgreSQL engines bypass RLS for superusers regardless of table configuration.
 - Transaction-scoped tenant setting (`app.current_tenant` with `is_local=true`)
   guaranteeing zero cross-tenant context leakage across connection pools.
+- Application-level authentication (`X-Tenant-ID` / `X-Tenant-Key`) remains part of
+  the Trusted Computing Base (TCB); caller-controlled GUCs do not replace gateway auth.
 - TLS reverse proxy/WAF with shared rate limiting and request-size limits.
 - Secret manager, key rotation, log redaction, metrics, traces, alerts, and on-call.
 - Privacy/retention policy, data subject request handling, threat model, and
