@@ -19,6 +19,11 @@ secrets, and API docs disabled by default. Startup checks both persistence schem
 
 - Managed PostgreSQL with TLS, encryption at rest, least-privilege runtime role,
   encrypted backups, and restore drills.
+- Row-Level Security (RLS) enabled and forced on all seven tenant-owned tables
+  (`t_memory`, `graph_nodes`, `graph_edges`, `group_votes`, `agent_runs`, `audit_events`, `recovery_cases`).
+- Dedicated runtime role `naviqra_app` configured with `NOSUPERUSER NOBYPASSRLS`.
+- Transaction-scoped tenant setting (`app.current_tenant` with `is_local=true`)
+  guaranteeing zero cross-tenant context leakage across connection pools.
 - TLS reverse proxy/WAF with shared rate limiting and request-size limits.
 - Secret manager, key rotation, log redaction, metrics, traces, alerts, and on-call.
 - Privacy/retention policy, data subject request handling, threat model, and

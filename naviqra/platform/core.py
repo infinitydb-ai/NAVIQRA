@@ -147,8 +147,8 @@ class PlatformStore:
             else:
                 db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_recovery_cases_tenant_idempotency ON recovery_cases(tenant, idempotency_key) WHERE idempotency_key IS NOT NULL")
 
-    def connect(self):
-        return self.database.connect()
+    def connect(self, tenant: str | None = None):
+        return self.database.connect(tenant=tenant)
 
     def check(self):
         self.database.check()
@@ -159,7 +159,7 @@ class PlatformStore:
         allowed = {"profile", "episodic", "semantic", "procedural", "active"}
         if tier not in allowed:
             raise ValueError("tier must be one of " + ", ".join(sorted(allowed)))
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             db.execute("""INSERT INTO t_memory VALUES(?,?,?,?,?,?)
               ON CONFLICT(tenant,traveler,tier,key) DO UPDATE SET
               value=excluded.value,updated_at=excluded.updated_at""",
@@ -168,7 +168,7 @@ class PlatformStore:
                 "key": key, "value": value}
 
     def get_memories(self, tenant: str, traveler: str):
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             rows = db.execute("""SELECT tier,key,value,updated_at FROM t_memory
               WHERE tenant=? AND traveler=? ORDER BY updated_at DESC""",
               (tenant, traveler)).fetchall()
@@ -177,7 +177,7 @@ class PlatformStore:
 
     def add_node(self, tenant: str, kind: str, label: str, properties: dict[str, Any]):
         node_id = str(uuid4())
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             db.execute("INSERT INTO graph_nodes VALUES(?,?,?,?,?,?)",
                        (tenant,node_id,kind,label,json.dumps(properties),utcnow()))
         return {"id": node_id, "kind": kind, "label": label, "properties": properties}
@@ -185,7 +185,7 @@ class PlatformStore:
     def add_edge(self, tenant: str, source: str, relation: str, target: str,
                  properties: dict[str, Any] | None = None):
         edge_id = str(uuid4())
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             exists = db.execute("""SELECT COUNT(*) n FROM graph_nodes
                 WHERE tenant=? AND id IN (?,?)""", (tenant,source,target)).fetchone()["n"]
             if exists != 2:
@@ -196,7 +196,7 @@ class PlatformStore:
                 "properties": properties or {}}
 
     def graph(self, tenant: str, limit: int = 100):
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             nodes = db.execute("SELECT * FROM graph_nodes WHERE tenant=? ORDER BY created_at DESC LIMIT ?",
                                (tenant,limit)).fetchall()
             edges = db.execute("SELECT * FROM graph_edges WHERE tenant=? ORDER BY created_at DESC LIMIT ?",
@@ -212,7 +212,7 @@ class PlatformStore:
              score: float, weight: float = 1.0):
         if not 0 <= score <= 1 or not 0 < weight <= 10:
             raise ValueError("score must be 0..1 and weight must be >0..10")
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             db.execute("""INSERT INTO group_votes VALUES(?,?,?,?,?,?,?)
               ON CONFLICT(tenant,group_id,member_id,candidate_id) DO UPDATE SET
               score=excluded.score,weight=excluded.weight,created_at=excluded.created_at""",
@@ -220,7 +220,7 @@ class PlatformStore:
         return self.consensus(tenant, group_id)
 
     def consensus(self, tenant: str, group_id: str):
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             rows = db.execute("""SELECT candidate_id, SUM(score*weight)/SUM(weight) AS score,
               COUNT(DISTINCT member_id) AS voters FROM group_votes
               WHERE tenant=? AND group_id=? GROUP BY candidate_id ORDER BY score DESC,candidate_id""",
@@ -230,7 +230,7 @@ class PlatformStore:
             for r in rows]}
 
     def save_run(self, tenant: str, run_id: str, task_type: str, status: str, result: Any):
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             db.execute("INSERT INTO agent_runs VALUES(?,?,?,?,?,?)",
                        (tenant,run_id,task_type,status,json.dumps(result),utcnow()))
 
@@ -280,7 +280,7 @@ class PlatformStore:
 
         case_id = str(uuid4())
         now = utcnow()
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             db.execute(
                 """INSERT INTO recovery_cases(tenant, case_id, trip_id, disruption, options,
                    selected_option, status, created_at, updated_at, approval_metadata,
@@ -295,13 +295,13 @@ class PlatformStore:
         return self.get_recovery(tenant, case_id)
 
     def get_recovery(self, tenant: str, case_id: str) -> dict[str, Any] | None:
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             row = db.execute("SELECT * FROM recovery_cases WHERE tenant=? AND case_id=?",
                              (tenant, case_id)).fetchone()
         return self._recovery_from_row(row) if row else None
 
     def list_recoveries(self, tenant: str, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             if status:
                 rows = db.execute(
                     "SELECT * FROM recovery_cases WHERE tenant=? AND status=? ORDER BY created_at DESC LIMIT ?",
@@ -326,7 +326,7 @@ class PlatformStore:
             raise RecoveryValidationError(f"selected_option_id '{selected_option_id}' does not match any available option in this recovery case")
 
         now = utcnow()
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             cursor = db.execute(
                 "UPDATE recovery_cases SET selected_option=?, updated_at=? WHERE tenant=? AND case_id=? AND status='awaiting_selection'",
                 (json.dumps(matching), now, tenant, case_id)
@@ -358,7 +358,7 @@ class PlatformStore:
             action = "recovery.rejected"
             approval_meta = {"approver": approver.strip(), "rejected_at": now, "notes": notes, "decision": "rejected"}
 
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             cursor = db.execute(
                 "UPDATE recovery_cases SET status=?, updated_at=?, approval_metadata=? WHERE tenant=? AND case_id=? AND status='awaiting_selection'",
                 (target_status, now, json.dumps(approval_meta), tenant, case_id)
@@ -384,7 +384,7 @@ class PlatformStore:
                 return self._await_recovery_resolution(tenant, case_id, idempotency_key)
 
         # Verify idempotency key is not stolen by another case
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             existing = db.execute(
                 "SELECT case_id FROM recovery_cases WHERE tenant=? AND idempotency_key=? AND case_id != ?",
                 (tenant, idempotency_key, case_id)
@@ -415,7 +415,7 @@ class PlatformStore:
             "details": sanitized_details
         }
         try:
-            with self.connect() as db:
+            with self.connect(tenant) as db:
                 cursor = db.execute(
                     "UPDATE recovery_cases SET status='executing', updated_at=?, idempotency_key=?, execution_metadata=? WHERE tenant=? AND case_id=? AND status='approved'",
                     (now, idempotency_key, json.dumps(exec_meta), tenant, case_id)
@@ -437,7 +437,7 @@ class PlatformStore:
                 err_now = utcnow()
                 fail_meta = {**exec_meta, "failed_at": err_now, "error": "Simulated supplier inventory rejection or payment failure"}
                 fail_outcome = {"outcome": "failed", "error": "Simulated supplier error", "provider": provider, "failed_at": err_now}
-                with self.connect() as db:
+                with self.connect(tenant) as db:
                     db.execute(
                         "UPDATE recovery_cases SET status='failed', updated_at=?, execution_metadata=?, resolution_outcome=? WHERE tenant=? AND case_id=? AND status='executing'",
                         (err_now, json.dumps(fail_meta), json.dumps(fail_outcome), tenant, case_id)
@@ -464,7 +464,7 @@ class PlatformStore:
                     "mode": "simulation",
                     "booking_mode": "simulated_non_bookable"
                 }
-                with self.connect() as db:
+                with self.connect(tenant) as db:
                     db.execute(
                         "UPDATE recovery_cases SET status='resolved', updated_at=?, execution_metadata=?, resolution_outcome=? WHERE tenant=? AND case_id=? AND status='executing'",
                         (res_now, json.dumps(success_meta), json.dumps(resolution), tenant, case_id)
@@ -499,7 +499,7 @@ class PlatformStore:
             "cancelled_by": cancelled_by.strip(),
             "cancelled_at": now
         }
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             cursor = db.execute(
                 "UPDATE recovery_cases SET status='cancelled', updated_at=?, execution_metadata=?, resolution_outcome=? WHERE tenant=? AND case_id=? AND status IN ('awaiting_selection', 'approved')",
                 (now, json.dumps(cancel_meta), json.dumps(cancel_outcome), tenant, case_id)
@@ -513,7 +513,7 @@ class PlatformStore:
         case = self.get_recovery(tenant, case_id)
         if case is None:
             raise RecoveryCaseNotFoundError(f"recovery case '{case_id}' not found")
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             rows = db.execute(
                 "SELECT * FROM audit_events WHERE tenant=? AND resource_type='recovery_case' AND resource_id=? ORDER BY created_at ASC, event_id ASC",
                 (tenant, case_id)
@@ -530,23 +530,11 @@ class PlatformStore:
             }
             for r in rows
         ]
-        return [
-            {
-                "event_id": r["event_id"],
-                "actor": r["actor"],
-                "action": r["action"],
-                "resource_type": r["resource_type"],
-                "resource_id": r["resource_id"],
-                "metadata": json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"],
-                "created_at": r["created_at"]
-            }
-            for r in rows
-        ]
 
     def audit(self, tenant: str, actor: str, action: str, resource_type: str,
               resource_id: str, metadata: dict[str, Any] | None = None):
         event_id = str(uuid4())
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             db.execute("INSERT INTO audit_events VALUES(?,?,?,?,?,?,?,?)",
                        (tenant,event_id,actor,action,resource_type,resource_id,
                         json.dumps(metadata or {}, sort_keys=True),utcnow()))
@@ -554,7 +542,7 @@ class PlatformStore:
                 "resource_type":resource_type,"resource_id":resource_id}
 
     def audit_events(self, tenant: str, limit: int = 100):
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             rows = db.execute("SELECT * FROM audit_events WHERE tenant=? ORDER BY created_at DESC LIMIT ?",
                               (tenant,limit)).fetchall()
         return [{"event_id":r["event_id"],"actor":r["actor"],"action":r["action"],
@@ -562,7 +550,7 @@ class PlatformStore:
                  "metadata":json.loads(r["metadata"]),"created_at":r["created_at"]} for r in rows]
 
     def delete_traveler(self, tenant: str, traveler: str):
-        with self.connect() as db:
+        with self.connect(tenant) as db:
             cursor = db.execute("DELETE FROM t_memory WHERE tenant=? AND traveler=?", (tenant,traveler))
             deleted = cursor.rowcount
         self.audit(tenant,"tenant_api","privacy.delete_traveler_memory","traveler",traveler,

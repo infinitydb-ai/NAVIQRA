@@ -34,3 +34,27 @@ API gateway -> authenticated tenant context -> orchestration service -> agent wo
 ## v0.3.0 enterprise intelligence plane
 
 The v2 tenant API fronts `PlatformStore` and `AgentRuntime`. The five capabilities are implemented as tenant-scoped persistent primitives: registered agent handlers, five-tier memory, typed graph nodes/edges, weighted group consensus, and approval-gated recovery proposals. `NaviqraClient` is the server-to-server Python SDK. Current storage is SQLite for local evaluation; production deployment requires managed PostgreSQL, OIDC/API-gateway identity, migrations, rate limiting, observability and tested provider adapters.
+
+## Database-enforced tenant isolation (PostgreSQL RLS)
+
+Production multi-tenancy employs defense-in-depth database enforcement via PostgreSQL Row-Level Security (RLS):
+
+1. **Transaction-Scoped Tenant Context**:
+   Application queries set `app.current_tenant` using transaction-local configuration:
+   `SELECT set_config('app.current_tenant', %s, true);`
+   With `is_local = true`, the parameter is strictly bound to the active transaction. When the transaction commits or rolls back, PostgreSQL automatically resets the setting, preventing context leakage across pooled or reused connections.
+
+2. **Fail-Closed Engine Policies**:
+   Policies on all seven tenant-owned tables enforce:
+   `USING (tenant = NULLIF(current_setting('app.current_tenant', true), ''))`
+   `WITH CHECK (tenant = NULLIF(current_setting('app.current_tenant', true), ''))`
+   If `app.current_tenant` is unset, empty, or mismatched, `NULLIF` evaluates to `NULL`, resulting in zero rows returned and write rejections.
+
+3. **Forced Table Policies**:
+   All tenant tables (`t_memory`, `graph_nodes`, `graph_edges`, `group_votes`, `agent_runs`, `audit_events`, `recovery_cases`) have both `ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY` applied, ensuring table owners are bound by RLS policies.
+
+4. **Least-Privilege Runtime Role**:
+   The runtime application connects under a dedicated unprivileged role (`naviqra_app`) defined as `NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS`.
+
+5. **Dual-Layer Architecture**:
+   SQLite remains fully supported for local development and deterministic offline testing using explicit application-level filtering (`WHERE tenant = ?`). In PostgreSQL production environments, database engine RLS operates beneath application queries, providing guaranteed multi-tenant isolation even in the event of application logic regressions.

@@ -13,9 +13,10 @@ from typing import Any, Iterator
 
 
 class DatabaseConnection:
-    def __init__(self, connection: Any, dialect: str):
+    def __init__(self, connection: Any, dialect: str, tenant: str | None = None):
         self.raw = connection
         self.dialect = dialect
+        self.tenant = tenant
 
     def execute(self, sql: str, params: tuple[Any, ...] | list[Any] = ()):
         if self.dialect == "postgresql":
@@ -26,16 +27,39 @@ class DatabaseConnection:
         if self.dialect == "sqlite":
             self.raw.executescript(script)
             return
-        # Schema scripts in this project contain no procedural blocks or semicolons
-        # embedded in string literals.
-        for statement in script.split(";"):
-            statement = statement.strip()
-            if statement:
-                self.execute(statement)
+        statements = []
+        current = []
+        in_dollar = False
+        i = 0
+        n = len(script)
+        while i < n:
+            if script[i:i+2] == "$$":
+                in_dollar = not in_dollar
+                current.append("$$")
+                i += 2
+                continue
+            if script[i] == ";" and not in_dollar:
+                stmt = "".join(current).strip()
+                if stmt:
+                    statements.append(stmt)
+                current = []
+                i += 1
+                continue
+            current.append(script[i])
+            i += 1
+        stmt = "".join(current).strip()
+        if stmt:
+            statements.append(stmt)
+
+        for statement in statements:
+            self.execute(statement)
 
     def __enter__(self):
         if hasattr(self.raw, "__enter__"):
             self.raw.__enter__()
+        if self.dialect == "postgresql":
+            val = self.tenant if self.tenant is not None else ""
+            self.execute("SELECT set_config('app.current_tenant', %s, true)", (val,))
         return self
 
     def close(self) -> None:
@@ -69,12 +93,12 @@ class Database:
             self.path = path
             self._connect_impl = lambda: sqlite3.connect(path, timeout=20, check_same_thread=False)
 
-    def connect(self) -> DatabaseConnection:
+    def connect(self, tenant: str | None = None) -> DatabaseConnection:
         raw = self._connect_impl()
         if self.dialect == "sqlite":
             raw.row_factory = sqlite3.Row
             raw.execute("PRAGMA foreign_keys=ON")
-        return DatabaseConnection(raw, self.dialect)
+        return DatabaseConnection(raw, self.dialect, tenant=tenant)
 
     def initialize_script(self, script: str) -> None:
         if self.dialect == "sqlite":
