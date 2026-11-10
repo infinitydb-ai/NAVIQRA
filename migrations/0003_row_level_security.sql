@@ -73,8 +73,8 @@ CREATE POLICY tenant_isolation_policy ON recovery_cases
 
 -- 3. Dedicated unprivileged application runtime role definition
 -- Security requirement: No default or hardcoded credentials in migration files.
--- Role is created with NOLOGIN; production infrastructure must provision credentials
--- out-of-band via ALTER ROLE naviqra_app WITH LOGIN PASSWORD '...';
+-- Role is created with NOLOGIN, and production infrastructure must provision credentials
+-- out-of-band via ALTER ROLE naviqra_app WITH LOGIN PASSWORD.
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'naviqra_app') THEN
