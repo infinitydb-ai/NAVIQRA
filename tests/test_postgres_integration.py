@@ -170,30 +170,42 @@ def test_postgres_row_level_security_enforcement():
     app_db = Database(app_dsn)
     store = PlatformStore(app_dsn, initialize=False)
 
-    # Runtime role least-privilege boundary checks:
-    # 1. naviqra_app cannot alter or drop RLS policies
-    with app_db.connect() as conn:
-        with pytest.raises(Exception) as exc:
+    # Runtime role least-privilege boundary checks (each forbidden operation isolated in its own transaction):
+    # 1. naviqra_app cannot drop RLS policies
+    with pytest.raises(Exception) as exc:
+        with app_db.connect() as conn:
             conn.execute("DROP POLICY tenant_isolation_policy ON recovery_cases")
-        assert "must be owner" in str(exc.value).lower() or "permission denied" in str(exc.value).lower()
-        with pytest.raises(Exception) as exc:
+    assert "must be owner" in str(exc.value).lower() or "permission denied" in str(exc.value).lower()
+
+    # 2. naviqra_app cannot create RLS policies
+    with pytest.raises(Exception) as exc:
+        with app_db.connect() as conn:
             conn.execute("CREATE POLICY rogue ON recovery_cases FOR ALL USING (true)")
-        assert "must be owner" in str(exc.value).lower() or "permission denied" in str(exc.value).lower()
+    assert "must be owner" in str(exc.value).lower() or "permission denied" in str(exc.value).lower()
 
-    # 2. naviqra_app cannot drop or alter tables
-    with app_db.connect() as conn:
-        with pytest.raises(Exception) as exc:
+    # 3. naviqra_app cannot alter RLS policies
+    with pytest.raises(Exception) as exc:
+        with app_db.connect() as conn:
+            conn.execute("ALTER POLICY tenant_isolation_policy ON recovery_cases USING (true)")
+    assert "must be owner" in str(exc.value).lower() or "permission denied" in str(exc.value).lower()
+
+    # 4. naviqra_app cannot drop tables
+    with pytest.raises(Exception) as exc:
+        with app_db.connect() as conn:
             conn.execute("DROP TABLE recovery_cases")
-        assert "must be owner" in str(exc.value).lower() or "permission denied" in str(exc.value).lower()
-        with pytest.raises(Exception) as exc:
-            conn.execute("ALTER TABLE recovery_cases ADD COLUMN rogue TEXT")
-        assert "must be owner" in str(exc.value).lower() or "permission denied" in str(exc.value).lower()
+    assert "must be owner" in str(exc.value).lower() or "permission denied" in str(exc.value).lower()
 
-    # 3. naviqra_app cannot create roles
-    with app_db.connect() as conn:
-        with pytest.raises(Exception) as exc:
+    # 5. naviqra_app cannot alter tables
+    with pytest.raises(Exception) as exc:
+        with app_db.connect() as conn:
+            conn.execute("ALTER TABLE recovery_cases ADD COLUMN rogue TEXT")
+    assert "must be owner" in str(exc.value).lower() or "permission denied" in str(exc.value).lower()
+
+    # 6. naviqra_app cannot create roles
+    with pytest.raises(Exception) as exc:
+        with app_db.connect() as conn:
             conn.execute("CREATE ROLE rogue_role")
-        assert "permission denied" in str(exc.value).lower()
+    assert "permission denied" in str(exc.value).lower()
 
     tenant_a = f"tenant-a-{uuid4()}"
     tenant_b = f"tenant-b-{uuid4()}"
@@ -272,22 +284,24 @@ def test_postgres_row_level_security_enforcement():
         assert len(conn.execute("SELECT * FROM t_memory").fetchall()) == 0
         assert len(conn.execute("SELECT * FROM graph_nodes").fetchall()) == 0
         assert len(conn.execute("SELECT * FROM audit_events").fetchall()) == 0
-        with pytest.raises(Exception) as exc_info:
+
+    with pytest.raises(Exception) as exc_info:
+        with app_db.connect() as conn:
             conn.execute(
                 "INSERT INTO recovery_cases(tenant, case_id, trip_id, disruption, options, status, created_at, updated_at) "
                 "VALUES ('unauth', 'c-missing', 'trip', 'd', '[]', 'awaiting_selection', '2026-01-01', '2026-01-01')"
             )
-        assert "violates row-level security policy" in str(exc_info.value).lower()
+    assert "violates row-level security policy" in str(exc_info.value).lower()
 
     # Criterion 8: Invalid tenant context: Inserting data with tenant != current_setting is rejected by WITH CHECK
-    with app_db.connect(tenant=tenant_a) as conn:
-        with pytest.raises(Exception) as exc_info:
+    with pytest.raises(Exception) as exc_info:
+        with app_db.connect(tenant=tenant_a) as conn:
             conn.execute(
                 "INSERT INTO recovery_cases(tenant, case_id, trip_id, disruption, options, status, created_at, updated_at) "
                 "VALUES (?, 'c-invalid', 'trip', 'd', '[]', 'awaiting_selection', '2026-01-01', '2026-01-01')",
                 (tenant_b,)
             )
-        assert "violates row-level security policy" in str(exc_info.value).lower()
+    assert "violates row-level security policy" in str(exc_info.value).lower()
 
     # Criterion 9: Context reset on COMMIT
     with app_db.connect(tenant=tenant_a) as conn:
