@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import threading
+import time
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -41,8 +43,47 @@ class PlatformStore:
     def __init__(self, path: str | Path, *, initialize: bool = True):
         self.path = str(path)
         self.database = Database(self.path)
+        self._case_conditions: dict[tuple[str, str], threading.Condition] = {}
+        self._condition_lock = threading.Lock()
         if initialize:
             self._initialize()
+
+    def _get_case_condition(self, tenant: str, case_id: str) -> threading.Condition:
+        key = (tenant, case_id)
+        with self._condition_lock:
+            if key not in self._case_conditions:
+                self._case_conditions[key] = threading.Condition()
+            return self._case_conditions[key]
+
+    def _notify_case_condition(self, tenant: str, case_id: str) -> None:
+        key = (tenant, case_id)
+        with self._condition_lock:
+            cond = self._case_conditions.get(key)
+        if cond:
+            with cond:
+                cond.notify_all()
+
+    def _await_recovery_resolution(self, tenant: str, case_id: str, idempotency_key: str,
+                                   timeout: float = 10.0) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        cond = self._get_case_condition(tenant, case_id)
+        while time.monotonic() < deadline:
+            current = self.get_recovery(tenant, case_id)
+            if not current:
+                raise RecoveryCaseNotFoundError(f"recovery case '{case_id}' not found")
+            if current.get("idempotency_key") != idempotency_key:
+                raise RecoveryConflictError("Concurrent execution detected: idempotency_key conflict.")
+            if current["status"] in {"resolved", "failed"}:
+                if current.get("resolution_outcome") is not None:
+                    return current
+            with cond:
+                cond.wait(timeout=0.05)
+
+        current = self.get_recovery(tenant, case_id)
+        if current and current.get("idempotency_key") == idempotency_key:
+            if current["status"] in {"resolved", "failed"} and current.get("resolution_outcome") is not None:
+                return current
+        raise RecoveryConflictError("Recovery execution is currently in progress. Please retry shortly.")
 
     def _initialize(self):
         with self.connect() as db:
@@ -337,8 +378,10 @@ class PlatformStore:
 
         # Idempotency replay check for this case
         if case.get("idempotency_key") == idempotency_key:
-            if case["status"] in {"executing", "resolved", "failed"}:
+            if case["status"] in {"resolved", "failed"}:
                 return case
+            if case["status"] == "executing":
+                return self._await_recovery_resolution(tenant, case_id, idempotency_key)
 
         # Verify idempotency key is not stolen by another case
         with self.connect() as db:
@@ -383,60 +426,53 @@ class PlatformStore:
             raise
 
         if cursor.rowcount == 0:
-            import time
-            current = None
-            for _ in range(40):
-                current = self.get_recovery(tenant, case_id)
-                if current and current.get("idempotency_key") == idempotency_key:
-                    if current["status"] in {"resolved", "failed"}:
-                        return current
-                time.sleep(0.05)
-            if current and current.get("idempotency_key") == idempotency_key:
-                return current
-            raise RecoveryConflictError("Concurrent execution detected: case is not in approved state.")
+            return self._await_recovery_resolution(tenant, case_id, idempotency_key)
 
-        # Log operational audit event without sensitive details
-        self.audit(tenant, "recovery_executor", "recovery.execution_started", "recovery_case", case_id,
-                   {"idempotency_key": idempotency_key, "provider": provider, "mode": "simulation"})
+        try:
+            # Log operational audit event without sensitive details
+            self.audit(tenant, "recovery_executor", "recovery.execution_started", "recovery_case", case_id,
+                       {"idempotency_key": idempotency_key, "provider": provider, "mode": "simulation"})
 
-        if simulate_failure:
-            err_now = utcnow()
-            fail_meta = {**exec_meta, "failed_at": err_now, "error": "Simulated supplier inventory rejection or payment failure"}
-            fail_outcome = {"outcome": "failed", "error": "Simulated supplier error", "provider": provider, "failed_at": err_now}
-            with self.connect() as db:
-                db.execute(
-                    "UPDATE recovery_cases SET status='failed', updated_at=?, execution_metadata=?, resolution_outcome=? WHERE tenant=? AND case_id=? AND status='executing'",
-                    (err_now, json.dumps(fail_meta), json.dumps(fail_outcome), tenant, case_id)
-                )
-            self.audit(tenant, "recovery_executor", "recovery.execution_failed", "recovery_case", case_id, fail_outcome)
-            return self.get_recovery(tenant, case_id)
-        else:
-            res_now = utcnow()
-            conf_id = f"SIM-REC-{uuid4().hex[:12].upper()}"
-            resolution = {
-                "outcome": "simulated_rebooking_confirmed",
-                "confirmation_id": conf_id,
-                "provider": provider,
-                "live_inventory": False,
-                "booking_mode": "simulated_non_bookable",
-                "resolved_at": res_now,
-                "selected_option": case["selected_option"],
-                "notice": "Simulated sandbox execution; no live external booking was performed."
-            }
-            success_meta = {
-                **exec_meta,
-                "resolved_at": res_now,
-                "confirmation_id": conf_id,
-                "mode": "simulation",
-                "booking_mode": "simulated_non_bookable"
-            }
-            with self.connect() as db:
-                db.execute(
-                    "UPDATE recovery_cases SET status='resolved', updated_at=?, execution_metadata=?, resolution_outcome=? WHERE tenant=? AND case_id=? AND status='executing'",
-                    (res_now, json.dumps(success_meta), json.dumps(resolution), tenant, case_id)
-                )
-            self.audit(tenant, "recovery_executor", "recovery.resolved", "recovery_case", case_id, {"confirmation_id": conf_id, "provider": provider})
-            return self.get_recovery(tenant, case_id)
+            if simulate_failure:
+                err_now = utcnow()
+                fail_meta = {**exec_meta, "failed_at": err_now, "error": "Simulated supplier inventory rejection or payment failure"}
+                fail_outcome = {"outcome": "failed", "error": "Simulated supplier error", "provider": provider, "failed_at": err_now}
+                with self.connect() as db:
+                    db.execute(
+                        "UPDATE recovery_cases SET status='failed', updated_at=?, execution_metadata=?, resolution_outcome=? WHERE tenant=? AND case_id=? AND status='executing'",
+                        (err_now, json.dumps(fail_meta), json.dumps(fail_outcome), tenant, case_id)
+                    )
+                self.audit(tenant, "recovery_executor", "recovery.execution_failed", "recovery_case", case_id, fail_outcome)
+                return self.get_recovery(tenant, case_id)
+            else:
+                res_now = utcnow()
+                conf_id = f"SIM-REC-{uuid4().hex[:12].upper()}"
+                resolution = {
+                    "outcome": "simulated_rebooking_confirmed",
+                    "confirmation_id": conf_id,
+                    "provider": provider,
+                    "live_inventory": False,
+                    "booking_mode": "simulated_non_bookable",
+                    "resolved_at": res_now,
+                    "selected_option": case["selected_option"],
+                    "notice": "Simulated sandbox execution; no live external booking was performed."
+                }
+                success_meta = {
+                    **exec_meta,
+                    "resolved_at": res_now,
+                    "confirmation_id": conf_id,
+                    "mode": "simulation",
+                    "booking_mode": "simulated_non_bookable"
+                }
+                with self.connect() as db:
+                    db.execute(
+                        "UPDATE recovery_cases SET status='resolved', updated_at=?, execution_metadata=?, resolution_outcome=? WHERE tenant=? AND case_id=? AND status='executing'",
+                        (res_now, json.dumps(success_meta), json.dumps(resolution), tenant, case_id)
+                    )
+                self.audit(tenant, "recovery_executor", "recovery.resolved", "recovery_case", case_id, {"confirmation_id": conf_id, "provider": provider})
+                return self.get_recovery(tenant, case_id)
+        finally:
+            self._notify_case_condition(tenant, case_id)
 
     def cancel_recovery(self, tenant: str, case_id: str, reason: str, cancelled_by: str) -> dict[str, Any]:
         if not reason or not str(reason).strip():

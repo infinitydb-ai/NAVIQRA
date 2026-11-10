@@ -571,6 +571,55 @@ def test_concurrent_execution_same_idempotency_key():
     assert actions.count("recovery.execution_started") == 1
     assert actions.count("recovery.resolved") == 1
 
+    # Sequential replay of already resolved case returns identical confirmation ID without new audit events
+    replay = client.post(url_a(f"/recovery/{case_id}/execute"), headers=HEADERS_A, json={"idempotency_key": key})
+    assert replay.status_code == 200
+    assert replay.json()["resolution_outcome"]["confirmation_id"] == list(conf_ids)[0]
+    audit_events_after = client.get(url_a(f"/recovery/{case_id}/audit"), headers=HEADERS_A).json()["events"]
+    assert len(audit_events_after) == len(audit_events)
+
+
+def test_concurrent_execution_failure_same_idempotency_key():
+    from concurrent.futures import ThreadPoolExecutor
+
+    case = client.post(url_a("/recovery"), headers=HEADERS_A, json={
+        "trip_id": "trip-concur-fail", "disruption": "cancelled", "options": sample_options()
+    }).json()
+    case_id = case["case_id"]
+    client.post(url_a(f"/recovery/{case_id}/select"), headers=HEADERS_A, json={"selected_option_id": "opt-flight-101"})
+    client.post(url_a(f"/recovery/{case_id}/decision"), headers=HEADERS_A, json={"approved": True, "approver": "lead"})
+
+    key = "concurrent-fail-key-777"
+
+    def run_exec():
+        return client.post(url_a(f"/recovery/{case_id}/execute"), headers=HEADERS_A, json={
+            "idempotency_key": key,
+            "simulate_failure": True
+        })
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(run_exec) for _ in range(8)]
+        results = [f.result() for f in futures]
+
+    # All 8 requests must return 200 with failed status
+    assert all(r.status_code == 200 for r in results)
+    assert all(r.json()["status"] == "failed" for r in results)
+    assert all(r.json()["resolution_outcome"] is not None for r in results)
+    assert all(r.json()["resolution_outcome"]["outcome"] == "failed" for r in results)
+
+    # Exactly one execution_started and one execution_failed audit event
+    audit_events = client.get(url_a(f"/recovery/{case_id}/audit"), headers=HEADERS_A).json()["events"]
+    actions = [e["action"] for e in audit_events]
+    assert actions.count("recovery.execution_started") == 1
+    assert actions.count("recovery.execution_failed") == 1
+
+    # Sequential replay of failed case returns same outcome without new audit events
+    replay = client.post(url_a(f"/recovery/{case_id}/execute"), headers=HEADERS_A, json={"idempotency_key": key})
+    assert replay.status_code == 200
+    assert replay.json()["status"] == "failed"
+    after_replay_events = client.get(url_a(f"/recovery/{case_id}/audit"), headers=HEADERS_A).json()["events"]
+    assert len(after_replay_events) == len(audit_events)
+
 
 def test_concurrent_execution_different_idempotency_keys():
     from concurrent.futures import ThreadPoolExecutor
